@@ -1,12 +1,29 @@
 import WebSocket, { WebSocketServer } from "ws";
+import http from "http";
 
 const PORT = process.env.PORT || 5000;
-const wss = new WebSocketServer({ port: PORT });
 
-console.log(`\n[WS] Signaling server running on port ${PORT}\n`);
+// Render expects an HTTP server on $PORT; we attach the WS to it so health checks pass.
+const server = http.createServer((req, res) => {
+    if (req.url === "/health") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, senders: senders.size }));
+        return;
+    }
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("signaling-server up");
+});
 
-// Active senders: senderId -> { socket, viewers: Set<WebSocket> }
+const wss = new WebSocketServer({ server, path: "/ws" });
+
+server.listen(PORT, () => {
+    console.log(`\n[WS] Signaling server listening on :${PORT} (path /ws)\n`);
+});
+
+// senderId -> { socket, viewers: Set<WebSocket> }
 const senders = new Map();
+// Viewers waiting for a sender that hasn't registered yet: senderId -> Set<WebSocket>
+const pendingViewers = new Map();
 
 function sendJSON(socket, obj) {
     if (socket.readyState === WebSocket.OPEN) {
@@ -18,21 +35,37 @@ function logDivider() {
     console.log("------------------------------------------------------------");
 }
 
+// Heartbeat to keep idle Render WebSockets alive (they get killed after ~60s)
+function heartbeat() { this.isAlive = true; }
+const hbInterval = setInterval(() => {
+    wss.clients.forEach(ws => {
+        if (ws.isAlive === false) return ws.terminate();
+        ws.isAlive = false;
+        try { ws.ping(); } catch {}
+    });
+}, 25000);
+wss.on("close", () => clearInterval(hbInterval));
+
 wss.on("connection", socket => {
     console.log("[WS] New client connected");
+    socket.isAlive = true;
+    socket.on("pong", heartbeat);
 
     socket.on("message", raw => {
+        // Cap message size (SDP rarely above ~32KB; refuse anything wild)
+        if (raw.length > 256 * 1024) {
+            console.warn("[WS] Oversized message, dropping");
+            return;
+        }
+
         let msg;
-        try {
-            msg = JSON.parse(raw.toString());
-        } catch {
-            console.log("[WS] ❌ Invalid JSON:", raw.toString());
+        try { msg = JSON.parse(raw.toString()); }
+        catch {
+            console.log("[WS] Invalid JSON");
             return;
         }
 
         const type = msg.type;
-
-        console.log(msg);
 
         // ----------------------------------------------------
         // 1. Sender registers
@@ -41,25 +74,33 @@ wss.on("connection", socket => {
             const { senderId } = msg;
             if (!senderId) return;
 
-            senders.set(senderId, {
-                socket,
-                viewers: new Set()
-            });
+            // Replace any existing sender with same ID (e.g. Unity reconnect)
+            const prev = senders.get(senderId);
+            if (prev && prev.socket !== socket) {
+                try { prev.socket.close(); } catch {}
+            }
 
+            senders.set(senderId, { socket, viewers: new Set() });
             socket.role = "sender";
             socket.senderId = senderId;
 
             logDivider();
-            console.log(`[WS] 📡 Sender Registered`);
-            console.log(`     Sender ID: ${senderId}`);
-            console.log(`     Total Senders: ${senders.size}`);
+            console.log(`[WS] Sender registered: ${senderId} (total ${senders.size})`);
             logDivider();
 
-            sendJSON(socket, {
-                type: "sender-registered",
-                senderId
-            });
+            sendJSON(socket, { type: "sender-registered", senderId });
 
+            // If viewers were waiting for this sender, attach them now and ask sender for an offer
+            const waiting = pendingViewers.get(senderId);
+            if (waiting && waiting.size > 0) {
+                const entry = senders.get(senderId);
+                waiting.forEach(v => {
+                    if (v.readyState === WebSocket.OPEN) entry.viewers.add(v);
+                });
+                pendingViewers.delete(senderId);
+                console.log(`[WS] Re-attached ${entry.viewers.size} pending viewer(s) to ${senderId}`);
+                sendJSON(socket, { type: "viewer-request" });
+            }
             return;
         }
 
@@ -68,168 +109,98 @@ wss.on("connection", socket => {
         // ----------------------------------------------------
         if (type === "request-sender") {
             const { senderId } = msg;
-            const senderEntry = senders.get(senderId);
+            if (!senderId) return;
 
             socket.role = "viewer";
             socket.senderId = senderId;
 
+            const senderEntry = senders.get(senderId);
+
             logDivider();
-            console.log(`[WS] 👀 Viewer Requested Sender`);
-            console.log(`     Requested Sender: ${senderId}`);
-            console.log(`     Sender Available: ${!!senderEntry}`);
+            console.log(`[WS] Viewer requested ${senderId} | available=${!!senderEntry}`);
             logDivider();
 
             if (!senderEntry) {
-                sendJSON(socket, {
-                    type: "sender-unavailable",
-                    senderId
-                });
+                // Park viewer; notify so UI can show "sender offline"
+                if (!pendingViewers.has(senderId)) pendingViewers.set(senderId, new Set());
+                pendingViewers.get(senderId).add(socket);
+                sendJSON(socket, { type: "sender-unavailable", senderId });
                 return;
             }
 
             senderEntry.viewers.add(socket);
+            console.log(`[WS] Total viewers for ${senderId}: ${senderEntry.viewers.size}`);
 
-            console.log(`[WS] Viewer attached to sender ${senderId}`);
-            console.log(`     Total Viewers for ${senderId}: ${senderEntry.viewers.size}`);
-
-            sendJSON(senderEntry.socket, {
-                type: "viewer-request"
-            });
-
+            sendJSON(senderEntry.socket, { type: "viewer-request" });
             return;
         }
 
         // ----------------------------------------------------
-        // 3. Sender sends offer SDP
+        // 3. Sender offer SDP -> viewers
         // ----------------------------------------------------
         if (type === "sender-peer-id") {
-            const { peerId } = msg;
             const senderId = socket.senderId;
             if (!senderId) return;
+            const entry = senders.get(senderId);
+            if (!entry) return;
 
-            const senderEntry = senders.get(senderId);
-            if (!senderEntry) return;
-
-            logDivider();
-            console.log(`[WS] 🎥 Sender Offer Received`);
-            console.log(`     Sender: ${senderId}`);
-            console.log(`     Viewers to notify: ${senderEntry.viewers.size}`);
-            logDivider();
-
-            senderEntry.viewers.forEach(viewerSocket => {
-                sendJSON(viewerSocket, {
-                    type: "deliver-peer-id",
-                    peerId
-                });
-            });
-
+            console.log(`[WS] Sender offer for ${senderId} -> ${entry.viewers.size} viewer(s)`);
+            entry.viewers.forEach(v => sendJSON(v, { type: "deliver-peer-id", peerId: msg.peerId }));
             return;
         }
 
         // ----------------------------------------------------
-        // 4. Viewer sends answer SDP
+        // 4. Viewer answer SDP -> sender
         // ----------------------------------------------------
         if (type === "viewer-answer") {
-            const { answer } = msg;
             const senderId = socket.senderId;
-            if (!senderId) return;
-
-            const senderEntry = senders.get(senderId);
-            if (!senderEntry) return;
-
-            logDivider();
-            console.log(`[WS] 🔄 Viewer Answer Received`);
-            console.log(`     Sender: ${senderId}`);
-            logDivider();
-
-            sendJSON(senderEntry.socket, {
-                type: "viewer-answer",
-                answer
-            });
-
+            const entry = senders.get(senderId);
+            if (!entry) return;
+            console.log(`[WS] Viewer answer -> sender ${senderId}`);
+            sendJSON(entry.socket, { type: "viewer-answer", answer: msg.answer });
             return;
         }
 
         // ----------------------------------------------------
-        // 5. Viewer ICE → Sender
+        // 5. Viewer ICE -> sender
         // ----------------------------------------------------
         if (type === "viewer-ice") {
-            const { candidate } = msg;
             const senderId = socket.senderId;
-
-            const senderEntry = senders.get(senderId);
-            if (!senderEntry) return;
-
-            console.log(`[WS] ❄ Viewer ICE → Sender (${senderId})`);
-
-            sendJSON(senderEntry.socket, {
-                type: "viewer-ice",
-                candidate
-            });
-
+            const entry = senders.get(senderId);
+            if (!entry) return;
+            sendJSON(entry.socket, { type: "viewer-ice", candidate: msg.candidate });
             return;
         }
 
         // ----------------------------------------------------
-        // 6. Sender ICE → Viewers
+        // 6. Sender ICE -> viewers
         // ----------------------------------------------------
         if (type === "sender-ice") {
-            const { candidate } = msg;
             const senderId = socket.senderId;
-
-            const senderEntry = senders.get(senderId);
-            if (!senderEntry) return;
-
-            console.log(`[WS] ❄ Sender ICE → Viewers (${senderId})`);
-
-            senderEntry.viewers.forEach(viewerSocket => {
-                sendJSON(viewerSocket, {
-                    type: "sender-ice",
-                    candidate
-                });
-            });
-
+            const entry = senders.get(senderId);
+            if (!entry) return;
+            entry.viewers.forEach(v => sendJSON(v, { type: "sender-ice", candidate: msg.candidate }));
             return;
         }
     });
 
-    // ----------------------------------------------------
-    // Disconnect handling
-    // ----------------------------------------------------
     socket.on("close", () => {
         if (socket.role === "sender" && socket.senderId) {
             const senderId = socket.senderId;
             const entry = senders.get(senderId);
-
-            logDivider();
-            console.log(`[WS] ❌ Sender Disconnected`);
-            console.log(`     Sender ID: ${senderId}`);
-            logDivider();
-
+            console.log(`[WS] Sender disconnected: ${senderId}`);
             if (entry) {
-                entry.viewers.forEach(viewerSocket => {
-                    sendJSON(viewerSocket, {
-                        type: "sender-disconnected",
-                        senderId
-                    });
-                });
+                entry.viewers.forEach(v => sendJSON(v, { type: "sender-disconnected", senderId }));
             }
-
             senders.delete(senderId);
         }
 
         if (socket.role === "viewer" && socket.senderId) {
-            const senderId = socket.senderId;
-            const entry = senders.get(senderId);
-
-            logDivider();
-            console.log(`[WS] 👋 Viewer Disconnected`);
-            console.log(`     From Sender: ${senderId}`);
-            logDivider();
-
-            if (entry) {
-                entry.viewers.delete(socket);
-            }
+            const entry = senders.get(socket.senderId);
+            if (entry) entry.viewers.delete(socket);
+            const pending = pendingViewers.get(socket.senderId);
+            if (pending) pending.delete(socket);
+            console.log(`[WS] Viewer disconnected from ${socket.senderId}`);
         }
     });
 });
