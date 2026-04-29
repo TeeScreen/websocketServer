@@ -62,6 +62,8 @@ wss.on("connection", socket => {
         try { msg = JSON.parse(raw.toString()); }
         catch {
             console.log("[WS] Invalid JSON");
+            console.log(raw.toString());
+            console.log(msg);
             return;
         }
 
